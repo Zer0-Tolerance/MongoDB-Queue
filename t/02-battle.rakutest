@@ -1,0 +1,481 @@
+use v6.d;
+use Test;
+
+# ── Prerequisites ─────────────────────────────────────────────────────────────
+
+my $client;
+my $can-connect = do {
+    use MongoDB::Fast;
+    $client = MongoDB::Fast.new(host => 'localhost', port => 27017);
+    await $client.ping;
+    True
+} // False;
+
+unless $can-connect {
+    skip-rest 'MongoDB not available on localhost:27017';
+    exit;
+}
+
+use MongoDB::Queue;
+
+constant TEST-DB   = 'mongodb_queue_battle';
+constant TEST-COL  = 'battle_jobs';
+constant TEST-TYPE = 'test-job';
+
+sub fresh-queue(*%args) {
+    MongoDB::Queue.new(
+        :$client,
+        db-name         => TEST-DB,
+        collection-name => TEST-COL,
+        max-attempts    => 3,
+        visibility-timeout => 10,
+        |%args,
+    )
+}
+
+my $q = fresh-queue();
+$q.drop;
+$q.ensure-indexes;
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — Payload edge cases
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'payload: empty hash', {
+    $q.clear;
+    my $id  = $q.enqueue({}, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    ok $job.defined,            'dequeued';
+    ok $job<payload> ~~ Hash,   'payload is a Hash';
+    is $job<payload>.keys.elems, 0, 'payload is empty';
+    $q.ack($job<_id>);
+};
+
+subtest 'payload: deeply nested hash', {
+    $q.clear;
+    my %deep = a => { b => { c => { d => 'leaf' } } };
+    $q.enqueue(%deep, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    is $job<payload><a><b><c><d>, 'leaf', 'deep nesting preserved';
+    $q.ack($job<_id>);
+};
+
+subtest 'payload: unicode strings', {
+    $q.clear;
+    my %pl = emoji => "🚀💥🎯", cjk => "日本語テスト", arabic => "مرحبا";
+    $q.enqueue(%pl, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    is $job<payload><emoji>,  "🚀💥🎯",   'emoji preserved';
+    is $job<payload><cjk>,    "日本語テスト", 'CJK preserved';
+    is $job<payload><arabic>, "مرحبا",    'Arabic preserved';
+    $q.ack($job<_id>);
+};
+
+subtest 'payload: array values', {
+    $q.clear;
+    $q.enqueue({ tags => ['alpha', 'beta', 'gamma'], scores => [10, 20, 30] }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    is $job<payload><tags>[0], 'alpha',  'array[0]';
+    is $job<payload><tags>[2], 'gamma',  'array[2]';
+    is $job<payload><scores>[1], 20,     'numeric array preserved';
+    $q.ack($job<_id>);
+};
+
+subtest 'payload: large string (50 KB)', {
+    $q.clear;
+    my Str $big = 'x' x 51_200;
+    $q.enqueue({ blob => $big }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    is $job<payload><blob>.chars, 51_200, 'large payload round-trips intact';
+    $q.ack($job<_id>);
+};
+
+subtest 'payload: integer and numeric fields', {
+    $q.clear;
+    $q.enqueue({ count => 42, ratio => 3.14e0, flag => True }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    is  $job<payload><count>, 42,   'integer preserved';
+    ok  $job<payload><ratio> ~~ Numeric, 'numeric preserved';
+    ok  $job<payload><flag>.so,      'boolean truthy preserved';
+    $q.ack($job<_id>);
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — Idempotency and guard rails
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'double-ack returns False', {
+    $q.clear;
+    my $id = $q.enqueue({ x => 1 }, TEST-TYPE);
+    $q.dequeue(TEST-TYPE);
+    ok  $q.ack($id), 'first ack succeeds';
+    nok $q.ack($id), 'second ack on done job returns False';
+};
+
+subtest 'ack unknown id returns False', {
+    nok $q.ack('no-such-id-ever'), 'ack unknown → False';
+};
+
+subtest 'nack unknown id returns False', {
+    nok $q.nack('no-such-id-ever'), 'nack unknown → False';
+};
+
+subtest 'fail already-done job returns False (status guard)', {
+    $q.clear;
+    my $id = $q.enqueue({ y => 2 }, TEST-TYPE);
+    $q.dequeue(TEST-TYPE);
+    $q.ack($id);
+    # fail() requires status=processing — done jobs are not re-failed
+    nok $q.fail($id), 'fail on done job returns False';
+};
+
+subtest 'ensure-indexes is idempotent', {
+    ok $q.ensure-indexes, 'second ensure-indexes call returns True';
+    ok $q.ensure-indexes, 'third ensure-indexes call returns True';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — Priority correctness
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'priority: strict descending order across 10 levels', {
+    $q.clear;
+    # Enqueue in shuffled priority order
+    for (0, 5, 3, 9, 1, 7, 2, 8, 4, 6).kv -> $seq, $p {
+        $q.enqueue({ seq => $seq, p => $p }, TEST-TYPE, priority => $p);
+    }
+    is $q.size(TEST-TYPE), 10, '10 jobs enqueued';
+
+    my @order;
+    while my $job = $q.dequeue(TEST-TYPE) {
+        @order.push($job<payload><p>);
+        $q.ack($job<_id>);
+    }
+
+    is @order.elems, 10, 'all 10 jobs dequeued';
+    is @order, @order.sort.reverse.list, 'dequeued in strict priority-descending order';
+};
+
+subtest 'priority: same-priority jobs all dequeue exactly once', {
+    $q.clear;
+    # Five jobs at equal priority — dequeue order is not guaranteed
+    # (BSON hash ordering makes multi-key sort non-deterministic), but
+    # all five must be delivered exactly once.
+    for ^5 -> $i { $q.enqueue(%(seq => $i), TEST-TYPE, priority => 0) }
+    my @seqs;
+    while my $job = $q.dequeue(TEST-TYPE) {
+        @seqs.push($job<payload><seq>);
+        $q.ack($job<_id>);
+    }
+    is @seqs.sort.list, (0,1,2,3,4).list,
+        'all 5 same-priority jobs delivered exactly once (order not asserted)';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — Delayed delivery
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'delayed job is invisible until its window opens', {
+    $q.clear;
+    $q.enqueue({ label => 'instant' }, TEST-TYPE);
+    $q.enqueue({ label => 'delayed' }, TEST-TYPE, delay => 2);
+
+    my $first = $q.dequeue(TEST-TYPE);
+    is $first<payload><label>, 'instant', 'immediate job dequeued';
+    $q.ack($first<_id>);
+
+    nok $q.dequeue(TEST-TYPE).defined, 'delayed job not yet visible';
+
+    sleep 3;   # wait past the delay
+
+    my $second = $q.dequeue(TEST-TYPE);
+    ok $second.defined,                   'delayed job now visible';
+    is $second<payload><label>, 'delayed', 'correct delayed job';
+    $q.ack($second<_id>);
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — Retry / nack mechanics
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'nack with delay: job re-appears after the delay', {
+    $q.clear;
+    $q.enqueue({ task => 'retry-me' }, TEST-TYPE, max-attempts => 5);
+    my $job1 = $q.dequeue(TEST-TYPE);
+    ok $q.nack($job1<_id>, delay => 2), 'nack with delay=2';
+
+    nok $q.dequeue(TEST-TYPE).defined, 'job not visible immediately after nack';
+
+    sleep 3;
+    my $job2 = $q.dequeue(TEST-TYPE);
+    ok $job2.defined,                         'job visible after delay';
+    is $job2<_id>,            $job1<_id>,      'same job id';
+    is $job2<attempts>,       2,               'attempt counter incremented';
+    $q.ack($job2<_id>);
+};
+
+subtest 'full retry exhaustion path', {
+    $q.clear;
+    my $id = $q.enqueue({ task => 'doomed' }, TEST-TYPE, max-attempts => 3);
+
+    # Attempt 1 — nack
+    my $j1 = $q.dequeue(TEST-TYPE); is $j1<attempts>, 1, 'attempt 1';
+    ok $q.nack($j1<_id>), 'nack 1';
+
+    # Attempt 2 — nack
+    my $j2 = $q.dequeue(TEST-TYPE); is $j2<attempts>, 2, 'attempt 2';
+    ok $q.nack($j2<_id>), 'nack 2';
+
+    # Attempt 3 — nack triggers auto-fail
+    my $j3 = $q.dequeue(TEST-TYPE); is $j3<attempts>, 3, 'attempt 3';
+    ok $q.nack($j3<_id>), 'nack 3 (exhausts max_attempts → auto-fail)';
+
+    is $q.size(TEST-TYPE),   0, 'no pending jobs';
+    is $q.failed(TEST-TYPE), 1, 'job in failed bucket';
+    nok $q.dequeue(TEST-TYPE).defined, 'failed job not re-dequeued';
+};
+
+subtest 'explicit fail bypasses remaining attempts', {
+    $q.clear;
+    $q.enqueue({ task => 'give-up' }, TEST-TYPE, max-attempts => 10);
+    my $job = $q.dequeue(TEST-TYPE);
+    is $job<attempts>, 1, 'first attempt';
+    ok $q.fail($job<_id>), 'explicit fail';
+    is $q.failed(TEST-TYPE), 1, 'immediately in failed';
+    is $q.size(TEST-TYPE),   0, 'not re-queued';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — Stale reclaim
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'stale reclaim: multiple stuck workers re-queued', {
+    $q.clear;
+    my @ids = (^3).map(-> $n { $q.enqueue(%(task => "t$n"), TEST-TYPE) });
+    # Dequeue all three (simulate workers that then hang)
+    my @jobs = (^3).map({ $q.dequeue(TEST-TYPE) });
+    is $q.in-flight(TEST-TYPE), 3, '3 jobs in flight';
+
+    # Back-date locked_at so they look stale
+    my $past = now.to-posix[0].Int - 200;
+    for @jobs -> $job {
+        await $client.db(TEST-DB).collection(TEST-COL)
+            .update-one({ _id => $job<_id> }, { '$set' => { locked_at => $past } });
+    }
+
+    my $reclaimed = $q.reclaim-stale(older-than => 10);
+    is $reclaimed,   3, '3 stale jobs reclaimed';
+    is $q.size(TEST-TYPE),      3, 'all 3 back in pending';
+    is $q.in-flight(TEST-TYPE), 0, 'nothing in flight';
+};
+
+subtest 'stale reclaim: exhausted-attempts job goes to failed', {
+    $q.clear;
+    my $id = $q.enqueue({ task => 'near-dead' }, TEST-TYPE, max-attempts => 2);
+
+    # Simulate 2 failed attempts
+    await $client.db(TEST-DB).collection(TEST-COL).update-one(
+        { _id => $id },
+        { '$set' => { status => 'processing', attempts => 2,
+                       locked_at => now.to-posix[0].Int - 200,
+                       locked_by => 'ghost-worker' } },
+    );
+
+    my $reclaimed = $q.reclaim-stale(older-than => 10);
+    is $reclaimed,   1,       '1 stale job processed';
+    is $q.failed(TEST-TYPE),  1,       'moved to failed (exhausted)';
+    is $q.size(TEST-TYPE),    0,       'not back in pending';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — Concurrent producers: no lost jobs
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'concurrent producers: all jobs land in the queue', {
+    $q.clear;
+
+    constant PROD-WORKERS = 8;
+    constant JOBS-PER-PROD = 10;
+    constant TOTAL-PROD    = PROD-WORKERS * JOBS-PER-PROD;
+
+    my @promises = (^PROD-WORKERS).map(-> $w {
+        start {
+            for ^JOBS-PER-PROD -> $j {
+                $q.enqueue({ worker => $w, job => $j }, TEST-TYPE);
+            }
+        }
+    });
+    await Promise.allof(@promises);
+
+    is $q.size(TEST-TYPE), TOTAL-PROD, "all {TOTAL-PROD} jobs present after concurrent enqueue";
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8 — Concurrent consumers: no duplicate processing
+#
+# This is the critical correctness test.  N jobs are enqueued; M workers race
+# to drain the queue.  Every job must be processed exactly once.
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'concurrent consumers: each job processed exactly once', {
+    # Reuse the 80 jobs from the previous subtest
+    is $q.size(TEST-TYPE), 80, 'starting with 80 pending jobs';
+
+    constant CON-WORKERS = 6;
+
+    my @seen-ids;
+    my $lock = Lock.new;
+
+    my @workers = (^CON-WORKERS).map(-> $w {
+        start {
+            my @mine;
+            loop {
+                my $job = $q.dequeue(TEST-TYPE, worker-id => "battle-worker-$w");
+                last without $job;
+                @mine.push($job<_id>);
+                $q.ack($job<_id>);
+            }
+            $lock.protect({ @seen-ids.append(@mine) });
+        }
+    });
+    await Promise.allof(@workers);
+
+    is @seen-ids.elems, 80, 'total processed == 80';
+    is @seen-ids.sort.unique.elems, 80, 'zero duplicate deliveries';
+    is $q.size(TEST-TYPE),      0, 'queue empty';
+    is $q.in-flight(TEST-TYPE), 0, 'nothing still in flight';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 — High-priority jobs jump the queue under concurrent load
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'priority: urgent job dequeued before bulk backlog', {
+    $q.clear;
+
+    # Enqueue 20 low-priority jobs
+    for ^20 -> $n { $q.enqueue(%(kind => 'bulk', n => $n), TEST-TYPE, priority => 0) }
+
+    # Enqueue 1 urgent job last
+    my $urgent-id = $q.enqueue({ kind => 'urgent' }, TEST-TYPE, priority => 100);
+
+    # The very next dequeue should return the urgent job
+    my $first = $q.dequeue(TEST-TYPE);
+    is $first<_id>, $urgent-id,    'urgent job jumped the 20-item backlog';
+    is $first<payload><kind>, 'urgent', 'correct payload';
+    $q.ack($first<_id>);
+    $q.clear;
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10 — Stats consistency
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'stats: all counters coherent', {
+    $q.clear;
+
+    for ^4 -> $n { $q.enqueue(%(n => $n), TEST-TYPE) }    # 4 pending
+    my $j1 = $q.dequeue(TEST-TYPE);                        # 1 processing, 3 pending
+    my $j2 = $q.dequeue(TEST-TYPE);                        # 2 processing, 2 pending
+    $q.ack($j1<_id>);                                      # 1 processing, 2 pending, 1 done
+    $q.fail($j2<_id>);                                     # 0 processing, 2 pending, 1 done, 1 failed
+
+    my %s = $q.stats(TEST-TYPE);
+    is %s<pending>,    2, 'stats.pending = 2';
+    is %s<processing>, 0, 'stats.processing = 0';
+    is %s<failed>,     1, 'stats.failed = 1';
+    is %s<total>,      4, 'stats.total = 4 (pending+done+failed)';
+
+    $q.purge;
+    is $q.total(TEST-TYPE), 2, 'purge removed done+failed; 2 pending remain';
+    $q.clear;
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11 — Two queue instances on the same collection
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'two queue instances share the same backend collection', {
+    $q.clear;
+
+    my $producer = fresh-queue();
+    my $consumer = fresh-queue();
+
+    my $id = $producer.enqueue({ msg => 'cross-instance' }, TEST-TYPE);
+    my $job = $consumer.dequeue(TEST-TYPE);
+    ok $job.defined,                             'consumer sees producer job';
+    is $job<_id>,             $id,               'same job id';
+    is $job<payload><msg>,   'cross-instance',   'payload intact';
+    ok $consumer.ack($job<_id>),                 'consumer acks successfully';
+
+    is $producer.total(TEST-TYPE), 1, 'producer sees the done job';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 12 — Throughput smoke test (non-asserting, informational)
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'throughput: 200-job enqueue+dequeue+ack cycle', {
+    $q.clear;
+    constant BATCH = 200;
+
+    my $t0 = now;
+    for ^BATCH -> $n { $q.enqueue(%(n => $n), TEST-TYPE) }
+    my $enqueue-s = now - $t0;
+
+    my $t1 = now;
+    my int $done = 0;
+    while my $job = $q.dequeue(TEST-TYPE) {
+        $q.ack($job<_id>);
+        $done++;
+    }
+    my $cycle-s = now - $t1;
+
+    is $done, BATCH, "all {BATCH} jobs processed";
+    is $q.size(TEST-TYPE), 0,   'queue empty after drain';
+
+    note "  enqueue {BATCH} jobs : {$enqueue-s.fmt('%.2f')}s "
+       ~ "({(BATCH / $enqueue-s).fmt('%.0f')} jobs/s)";
+    note "  dequeue+ack {BATCH}  : {$cycle-s.fmt('%.2f')}s "
+       ~ "({(BATCH / $cycle-s).fmt('%.0f')} ops/s)";
+    pass 'throughput subtest complete';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 13 — Purge and clear
+# ─────────────────────────────────────────────────────────────────────────────
+
+subtest 'purge removes only done and failed', {
+    $q.clear;
+    $q.enqueue({ z => 1 }, TEST-TYPE);                              # pending
+    my $j1 = $q.dequeue(TEST-TYPE); $q.ack($j1<_id>);              # done
+    my $j2-id = $q.enqueue({ z => 2 }, TEST-TYPE);
+    my $j2 = $q.dequeue(TEST-TYPE); $q.fail($j2<_id>);             # failed
+    $q.enqueue({ z => 3 }, TEST-TYPE);                              # pending (untouched)
+
+    is $q.total(TEST-TYPE),   3, '3 total before purge';
+    my $purged = $q.purge;
+    is $purged,    2, 'purge removed 2 (done + failed)';
+    is $q.total(TEST-TYPE),   1, '1 pending job remains';
+    is $q.size(TEST-TYPE),    1, 'size consistent';
+    $q.clear;
+};
+
+subtest 'clear removes everything including pending', {
+    $q.clear;
+    $q.enqueue({ a => 1 }, TEST-TYPE);
+    $q.enqueue({ b => 2 }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);                # leave one in processing
+
+    is $q.total(TEST-TYPE), 2, '2 total';
+    my $deleted = $q.clear;
+    is $deleted,   2, 'clear removed all 2';
+    is $q.total(TEST-TYPE),   0, 'collection empty';
+};
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Teardown
+# ─────────────────────────────────────────────────────────────────────────────
+
+$q.drop;
+done-testing;

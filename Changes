@@ -1,0 +1,24 @@
+{{$NEXT}}
+
+0.2.0  2026-03-22
+  - Added mandatory `type` parameter to enqueue, dequeue, enqueue-many,
+    dequeue-many, size, in-flight, failed, total, and stats — every queue
+    instance now supports multiple job types on a single collection
+  - listen gains :type named parameter (replaces hard-coded default)
+  - Updated both test suites (01-basic, 02-battle) to pass type argument
+  - Indexes updated to include `type` field in both compound index keys
+
+0.1.0  2026-03-21
+  - Initial release
+  - enqueue / dequeue / ack / nack / fail — core job lifecycle
+  - Priority scheduling (higher value dequeued first)
+  - Delayed delivery via :delay(N) seconds
+  - Configurable max-attempts per job or queue-wide default
+  - reclaim-stale — re-queue processing jobs from crashed workers
+  - purge / clear / drop — maintenance helpers
+  - ensure-indexes — compound indexes for efficient dequeue and stale scan
+  - size / in-flight / failed / total / stats — queue metrics
+  - enqueue-many / dequeue-many / ack-many — bulk operations
+  - listen — built-in blocking event loop with auto ack/nack
+  - MongoDB::Queue.connect — convenience factory constructor
+  - Human-readable _dt DateTime companions for all epoch fields

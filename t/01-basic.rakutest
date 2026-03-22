@@ -1,0 +1,191 @@
+use v6.d;
+use Test;
+
+# Skip the whole suite if MongoDB is not reachable
+my $client;
+my $can-connect = do {
+    use MongoDB::Fast;
+    $client = MongoDB::Fast.new(host => 'localhost', port => 27017);
+    await $client.ping;
+    True
+} // False;
+
+unless $can-connect {
+    skip-rest 'MongoDB not available on localhost:27017';
+    exit;
+}
+
+use MongoDB::Queue;
+
+constant TEST-DB   = 'mongodb_queue_test';
+constant TEST-COL  = 'jobs_test';
+constant TEST-TYPE = 'test-job';
+
+my $q = MongoDB::Queue.new(
+    :$client,
+    db-name         => TEST-DB,
+    collection-name => TEST-COL,
+    max-attempts    => 3,
+    visibility-timeout => 5,
+);
+
+# Clean slate
+$q.drop;
+$q.ensure-indexes;
+
+# ── enqueue / size ────────────────────────────────────────────────────────────
+subtest 'enqueue and size', {
+    is $q.size(TEST-TYPE),  0, 'queue starts empty';
+    is $q.total(TEST-TYPE), 0, 'total starts at 0';
+
+    my $id = $q.enqueue({ task => 'hello' }, TEST-TYPE);
+    ok $id.defined,            'enqueue returns an id';
+    ok $id ~~ /^ <xdigit>+ $/, 'id looks like a hex string';
+    is $q.size(TEST-TYPE),  1, 'size is now 1';
+    is $q.total(TEST-TYPE), 1, 'total is now 1';
+};
+
+# ── dequeue / ack ─────────────────────────────────────────────────────────────
+subtest 'dequeue and ack', {
+    my $job = $q.dequeue(TEST-TYPE);
+    ok $job.defined,               'dequeue returns a document';
+    is $job<payload><task>, 'hello', 'payload is intact';
+    is $job<status>,  'processing', 'status is processing after dequeue';
+    is $job<attempts>, 1,           'attempts incremented to 1';
+
+    is $q.size(TEST-TYPE),      0, 'size is 0 while job is in flight';
+    is $q.in-flight(TEST-TYPE), 1, 'in-flight is 1';
+
+    ok $q.ack($job<_id>), 'ack returns True';
+
+    is $q.size(TEST-TYPE),      0, 'size is still 0 after ack';
+    is $q.in-flight(TEST-TYPE), 0, 'in-flight is 0 after ack';
+    is $q.total(TEST-TYPE),     1, 'total still 1 (job is done, not deleted)';
+};
+
+# ── empty queue ───────────────────────────────────────────────────────────────
+subtest 'dequeue on empty queue', {
+    my $job = $q.dequeue(TEST-TYPE);
+    nok $job.defined, 'dequeue returns Nil on empty queue';
+};
+
+# ── nack and retry ────────────────────────────────────────────────────────────
+subtest 'nack and retry', {
+    my $id = $q.enqueue({ task => 'flaky' }, TEST-TYPE);
+
+    # First attempt
+    my $job1 = $q.dequeue(TEST-TYPE);
+    is $job1<attempts>, 1, 'first attempt = 1';
+    ok $q.nack($job1<_id>), 'nack returns True';
+    is $q.size(TEST-TYPE), 1, 'job is back in pending after nack';
+
+    # Second attempt
+    my $job2 = $q.dequeue(TEST-TYPE);
+    is $job2<_id>,      $id, 'same job id on retry';
+    is $job2<attempts>, 2,   'second attempt = 2';
+    ok $q.nack($job2<_id>), 'nack again';
+
+    # Third attempt — exhausts max_attempts=3
+    my $job3 = $q.dequeue(TEST-TYPE);
+    is $job3<attempts>, 3, 'third attempt = 3';
+    ok $q.nack($job3<_id>), 'nack on final attempt';
+
+    is $q.size(TEST-TYPE),   0, 'job no longer pending after exhausting attempts';
+    is $q.failed(TEST-TYPE), 1, 'job moved to failed';
+};
+
+# ── explicit fail ─────────────────────────────────────────────────────────────
+subtest 'explicit fail', {
+    my $id  = $q.enqueue({ task => 'must-fail' }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    ok $q.fail($job<_id>), 'fail returns True';
+    is $q.failed(TEST-TYPE), 2, 'failed count now 2';
+};
+
+# ── priority ordering ─────────────────────────────────────────────────────────
+subtest 'priority ordering', {
+    $q.purge;
+
+    $q.enqueue({ n => 1 }, TEST-TYPE, priority => 0);
+    $q.enqueue({ n => 2 }, TEST-TYPE, priority => 5);
+    $q.enqueue({ n => 3 }, TEST-TYPE, priority => 2);
+
+    my $first  = $q.dequeue(TEST-TYPE); $q.ack($first<_id>);
+    my $second = $q.dequeue(TEST-TYPE); $q.ack($second<_id>);
+    my $third  = $q.dequeue(TEST-TYPE); $q.ack($third<_id>);
+
+    is $first<payload><n>,  2, 'highest priority dequeued first';
+    is $second<payload><n>, 3, 'medium priority second';
+    is $third<payload><n>,  1, 'lowest priority last';
+};
+
+# ── delayed delivery ──────────────────────────────────────────────────────────
+subtest 'delayed delivery', {
+    $q.purge;
+
+    $q.enqueue({ task => 'now'   }, TEST-TYPE, delay => 0);
+    $q.enqueue({ task => 'later' }, TEST-TYPE, delay => 60);
+
+    my $job = $q.dequeue(TEST-TYPE);
+    is $job<payload><task>, 'now', 'immediate job dequeued, delayed job invisible';
+    $q.ack($job<_id>);
+
+    my $nothing = $q.dequeue(TEST-TYPE);
+    nok $nothing.defined, 'delayed job not yet visible';
+    $q.purge;
+};
+
+# ── stale reclaim ─────────────────────────────────────────────────────────────
+subtest 'stale reclaim', {
+    $q.clear;
+
+    my $id  = $q.enqueue({ task => 'stale' }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);   # now processing
+
+    # Force the locked_at to the past so it looks stale
+    await $q.client.db(TEST-DB).collection(TEST-COL).update-one(
+        { _id => $job<_id> },
+        { '$set' => { locked_at => (now.to-posix[0].Int - 100) } },
+    );
+
+    my $reclaimed = $q.reclaim-stale(older-than => 10);
+    is $reclaimed, 1, 'one stale job reclaimed';
+    is $q.size(TEST-TYPE), 1, 'reclaimed job is pending again';
+    $q.purge;
+};
+
+# ── stats ─────────────────────────────────────────────────────────────────────
+subtest 'stats', {
+    $q.clear;
+    $q.enqueue({ x => 1 }, TEST-TYPE);
+    $q.enqueue({ x => 2 }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+
+    my %s = $q.stats(TEST-TYPE);
+    is %s<pending>,    1, 'stats: pending';
+    is %s<processing>, 1, 'stats: processing';
+    is %s<failed>,     0, 'stats: failed';
+    is %s<total>,      2, 'stats: total';
+
+    $q.ack($job<_id>);
+    $q.purge;
+};
+
+# ── purge ─────────────────────────────────────────────────────────────────────
+subtest 'purge', {
+    $q.clear;
+
+    $q.enqueue({ y => 1 }, TEST-TYPE);
+    my $job = $q.dequeue(TEST-TYPE);
+    $q.ack($job<_id>);
+
+    is $q.total(TEST-TYPE), 1, 'one done job before purge';
+    my $deleted = $q.purge;
+    is $deleted,  1, 'purge deleted 1 job';
+    is $q.total(TEST-TYPE), 0, 'nothing left after purge';
+};
+
+# ── cleanup ───────────────────────────────────────────────────────────────────
+$q.drop;
+
+done-testing;

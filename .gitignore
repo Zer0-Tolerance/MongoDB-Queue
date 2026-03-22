@@ -1,0 +1,8 @@
+.precomp/
+lib/.precomp/
+*.log
+*.tmp
+.DS_Store
+.claude/
+battle-test.raku
+compare-*.raku
