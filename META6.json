@@ -12,7 +12,7 @@
     "provides"     : {
         "MongoDB::Queue" : "lib/MongoDB/Queue.rakumod"
     },
-    "source-url"   : "https://github.com/Zer0-Tolerance/MongoDB-Queue/archive/refs/tags/0.1.1.tar.gz",
+    "source-url"   : "https://github.com/Zer0-Tolerance/MongoDB-Queue/archive/refs/tags/v0.1.1.tar.gz",
     "support"      : {
         "source"    : "https://github.com/Zer0-Tolerance/MongoDB-Queue",
         "bugtracker": "https://github.com/Zer0-Tolerance/MongoDB-Queue/issues"
