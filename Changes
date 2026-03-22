@@ -1,6 +1,6 @@
 {{$NEXT}}
 
-0.2.0  2026-03-22
+0.1.1  2026-03-22
   - Added mandatory `type` parameter to enqueue, dequeue, enqueue-many,
     dequeue-many, size, in-flight, failed, total, and stats — every queue
     instance now supports multiple job types on a single collection

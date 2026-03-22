@@ -1,21 +1,21 @@
 {
     "name"         : "MongoDB::Queue",
-    "version"      : "0.2.0",
+    "version"      : "0.1.1",
     "description"  : "Fast, persistent, typed job queue backed by MongoDB::Fast",
     "perl"         : "6.d",
-    "auth"         : "zef:YOURZEFID",
+    "auth"         : "github:Zer0-Tolerance",
     "api"          : "1",
     "license"      : "Artistic-2.0",
-    "authors"      : [ "YOURNAME" ],
+    "authors"      : [ "Zer0-Tolerance" ],
     "depends"      : [ "MongoDB::Fast" ],
     "test-depends" : [ "Test" ],
     "provides"     : {
         "MongoDB::Queue" : "lib/MongoDB/Queue.rakumod"
     },
-    "source-url"   : "https://github.com/YOURGITHUB/MongoDB-Queue/archive/refs/tags/0.2.0.tar.gz",
+    "source-url"   : "https://github.com/Zer0-Tolerance/MongoDB-Queue/archive/refs/tags/0.1.1.tar.gz",
     "support"      : {
-        "source"    : "https://github.com/YOURGITHUB/MongoDB-Queue",
-        "bugtracker": "https://github.com/YOURGITHUB/MongoDB-Queue/issues"
+        "source"    : "https://github.com/Zer0-Tolerance/MongoDB-Queue",
+        "bugtracker": "https://github.com/Zer0-Tolerance/MongoDB-Queue/issues"
     },
     "resources"    : [],
     "tags"         : [
