@@ -7,6 +7,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.1] — 2026-03-22
+
+### Changed
+
+- Added mandatory `type` parameter to `enqueue`, `dequeue`, `enqueue-many`,
+  `dequeue-many`, `size`, `in-flight`, `failed`, `total`, and `stats` — every
+  queue instance now supports multiple job types on a single collection.
+- `listen` gains `:type` named parameter (replaces hard-coded default).
+- Indexes updated to include `type` field in both compound index keys.
+- Updated both test suites (`t/01-basic.rakutest`, `t/02-battle.rakutest`)
+  to pass the `type` argument throughout.
+
+---
+
 ## [0.1.0] — 2026-03-21
 
 ### Added
