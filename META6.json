@@ -3,7 +3,7 @@
     "version"      : "0.1.1",
     "description"  : "Fast, persistent, typed job queue backed by MongoDB::Fast",
     "perl"         : "6.d",
-    "auth"         : "github:Zer0-Tolerance",
+    "auth"         : "zef:Zer0-Tolerance",
     "api"          : "1",
     "license"      : "Artistic-2.0",
     "authors"      : [ "Zer0-Tolerance" ],
